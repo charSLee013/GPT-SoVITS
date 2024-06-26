@@ -401,68 +401,96 @@ class WNEncoder(nn.Module):
 class Generator(torch.nn.Module):
     def __init__(
         self,
-        initial_channel,
-        resblock,
-        resblock_kernel_sizes,
-        resblock_dilation_sizes,
-        upsample_rates,
-        upsample_initial_channel,
-        upsample_kernel_sizes,
-        gin_channels=0,
+        initial_channel,    # 输入通道数。
+        resblock,   # 残差块的类型，可以是 "1" 或 "2"。
+        resblock_kernel_sizes,  # 残差块的卷积核大小列表。
+        resblock_dilation_sizes, # 残差块的膨胀率列表。
+        upsample_rates, #  上采样率列表。
+        upsample_initial_channel, # 初始上采样通道数。
+        upsample_kernel_sizes, # 上采样卷积核大小列表。
+        gin_channels=0, #  全局条件输入的通道数，允许模型根据额外信息（如说话人身份）调整输出
     ):
         super(Generator, self).__init__()
+        # 计算残差块和上采样层的数量:
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
+
+        # 预处理卷积 (conv_pre): 将潜在向量映射到初始特征空间
         self.conv_pre = Conv1d(
             initial_channel, upsample_initial_channel, 7, 1, padding=3
         )
+        # 选择残差块类型:
         resblock = modules.ResBlock1 if resblock == "1" else modules.ResBlock2
 
+        # 通过循环构建多个上采样层，模型能够分步骤地将低分辨率特征逐步放大到最终所需的高分辨率输出，每次循环增加一部分分辨率。这种方式相较于一次性进行大量上采样，可以更好地保留和生成细节，同时保持计算效率。
+        # 上采样层 (ups): 使用转置卷积进行上采样，逐步增加时间分辨率，每层上采样的倍数由 upsample_rates 决定。
+        # 转置卷积与普通的卷积区别在于：普通卷积是将复杂的东西简单化，转置卷积将简单的东西复杂化，比如说超分辨率
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             self.ups.append(
                 weight_norm(
                     ConvTranspose1d(
-                        upsample_initial_channel // (2**i),
-                        upsample_initial_channel // (2 ** (i + 1)),
-                        k,
-                        u,
-                        padding=(k - u) // 2,
+                        upsample_initial_channel // (2**i), # 输入通道数: 表示随着层数增加，输入通道数逐渐减半。这样的设计有助于控制模型复杂度，同时使得特征逐步细化
+                        upsample_initial_channel // (2 ** (i + 1)), # 输出通道数: 随层数增加而减半，与输入通道数变化规律一致
+                        k,  # 卷积核大小: 直接来自upsample_kernel_sizes，决定了局部感受野的大小
+                        u,  # 上采样率: 决定了这一层将如何放大输入特征图的时间分辨率。
+                        padding=(k - u) // 2, #填充: 计算为(k - u) // 2，确保输出的长度符合预期，避免信息丢失或重复。这是为了保持时间维度上的平滑过渡，避免上采样时出现错位。
+
                     )
                 )
             )
 
+        # 用于构建一个残差块（Residual Block）的序列，这些残差块将被插入到上采样（转置卷积）层之间
+        # 它们帮助学习更复杂的特征表示并减少训练过程中的梯度消失问题
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
+            # 通道数，随着外层循环的进行而减半，确保残差块的输入输出通道数匹配，以便残差连接能直接相加。
             ch = upsample_initial_channel // (2 ** (i + 1))
             for j, (k, d) in enumerate(
                 zip(resblock_kernel_sizes, resblock_dilation_sizes)
             ):
+                # K: 残差块内部卷积层的核大小。
+                # d: 膨胀卷积的膨胀因子，用于控制卷积核点的间隔，有助于捕获更广泛上下文信息而不增加计算成本。
                 self.resblocks.append(resblock(ch, k, d))
 
+        # 后处理卷积 (conv_post): 将特征转换为单通道输出，对应梅尔频谱图。
         self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
         self.ups.apply(init_weights)
 
+        # 条件卷积 (cond): 如果提供全局条件输入，则应用此卷积层将条件向量映射到与特征相同的空间。
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
     def forward(self, x, g=None):
+        #  首先对输入x应用一个初始卷积操作self.conv_pre(x)，这一步通常用于调整输入特征图的通道数，为后续处理做准备。
         x = self.conv_pre(x)
         if g is not None:
+            # 如果提供了条件输入g，则通过self.cond(g)处理后与原始输入x相加。这在条件生成模型中很常见，比如在WaveNet或Text-to-Speech系统中，g可能携带文本或音调信息，用来指导声音的生成。
             x = x + self.cond(g)
 
+        # 循环上采样
         for i in range(self.num_upsamples):
+            # 对于每个上采样层,应用LeakyReLU激活函数，斜率为modules.LRELU_SLOPE，增加非线性
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            # 执行上采样操作，使用转置卷积层增大特征图的时间分辨率
             x = self.ups[i](x)
+            # 用于累加各残差块的输出。
             xs = None
+            # 在每个上采样步骤之后，还有一系列残差块操作。这些操作是分组进行的，每组内的残差块共享相同的上采样层后的特征图x作为输入
             for j in range(self.num_kernels):
                 if xs is None:
+                    # 对于该上采样层级内的每个残差块，取当前的特征图x作为输入，通过残差块处理后累加到xs上。
                     xs = self.resblocks[i * self.num_kernels + j](x)
                 else:
                     xs += self.resblocks[i * self.num_kernels + j](x)
+            # 最后，将累加的结果除以残差块的数量，实现平均操作，这是残差块的一种集成方式，有助于稳定学习过程和提高泛化性能。
+            # 每个上采样阶段后的残差块组，可以看作是在不同的分辨率尺度上逐步细化和增强特征表示。这种分层学习策略有助于模型捕捉从宏观到微观的多种特征模式。
             x = xs / self.num_kernels
+        # 再次应用Leaky ReLU激活函数。
         x = F.leaky_relu(x)
+        # 通过 conv_post 进行最后的卷积变换。
         x = self.conv_post(x)
+        # 使用tanh激活函数将输出限制在-1到1之间，这是生成梅尔频谱图的标准范围。
         x = torch.tanh(x)
 
         return x
